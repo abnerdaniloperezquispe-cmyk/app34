@@ -574,7 +574,12 @@ function showView(name){
 
   if(name === 'productos') renderProductos();
   if(name === 'categorias') renderCategorias();
-  if(name !== 'escaner') stopOcrScanner();
+  if(name === 'escaner'){
+    document.getElementById('scanResult').innerHTML = '';
+    if(!ocrActive) startOcrScanner();
+  }else{
+    stopOcrScanner();
+  }
 }
 
 function closeSidebarMobile(){
@@ -666,25 +671,36 @@ function setOcrStatus(msg){
   if(el) el.textContent = msg;
 }
 
+let ocrStarting = false;
+
 async function startOcrScanner(){
+  if(ocrActive || ocrStarting) return;
+  ocrStarting = true;
+
   if(typeof Tesseract === 'undefined'){
     setOcrStatus('No se pudo cargar Tesseract.js. Verifica tu conexión a internet o usa la búsqueda manual.');
+    ocrStarting = false;
     return;
   }
 
   const videoEl = document.getElementById('ocrVideo');
-  const toggleBtn = document.getElementById('btnToggleCamera');
 
   try{
     setOcrStatus('Iniciando cámara...');
     ocrStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' } }
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      },
+      audio: false
     });
     videoEl.srcObject = ocrStream;
     await videoEl.play();
   }catch(err){
     console.warn(err);
-    setOcrStatus('No se pudo acceder a la cámara. Verifica los permisos o usa la búsqueda manual.');
+    setOcrStatus('No se pudo acceder a la cámara. Verifica los permisos del navegador o usa la búsqueda manual.');
+    ocrStarting = false;
     return;
   }
 
@@ -693,23 +709,50 @@ async function startOcrScanner(){
     ocrWorker = await Tesseract.createWorker('eng');
     await ocrWorker.setParameters({
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
-      tessedit_pageseg_mode: '7'
+      tessedit_pageseg_mode: '6'
     });
   }catch(err){
     console.warn(err);
-    setOcrStatus('No se pudo iniciar el motor de lectura de texto.');
+    setOcrStatus('No se pudo iniciar el motor de lectura de texto. Verifica tu conexión a internet.');
+    ocrStarting = false;
     return;
   }
 
   ocrActive = true;
-  if(toggleBtn) toggleBtn.textContent = 'Detener cámara';
-  setOcrStatus('🔎 Buscando texto...');
+  ocrStarting = false;
+  setOcrStatus('🔎 Buscando código...');
   scheduleNextOcrCapture();
 }
 
 function scheduleNextOcrCapture(){
   if(!ocrActive) return;
   ocrTimer = setTimeout(runOcrCapture, OCR_INTERVAL_MS);
+}
+
+// Convierte el recorte a blanco y negro (umbral) para que Tesseract lea
+// mucho mejor las etiquetas fotografiadas con la cámara del celular.
+function preprocessCanvas(canvas){
+  const ctx = canvas.getContext('2d');
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = imgData.data;
+
+  // 1) escala de grises
+  const gray = new Uint8ClampedArray(canvas.width * canvas.height);
+  for(let i = 0, j = 0; i < d.length; i += 4, j++){
+    gray[j] = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+  }
+
+  // 2) umbral automático simple (media de brillo) para binarizar
+  let sum = 0;
+  for(let j = 0; j < gray.length; j++) sum += gray[j];
+  const mean = sum / gray.length;
+  const threshold = mean * 0.9; // un poco por debajo de la media favorece texto oscuro sobre fondo claro
+
+  for(let i = 0, j = 0; i < d.length; i += 4, j++){
+    const v = gray[j] > threshold ? 255 : 0;
+    d[i] = d[i+1] = d[i+2] = v;
+  }
+  ctx.putImageData(imgData, 0, 0);
 }
 
 async function runOcrCapture(){
@@ -720,13 +763,20 @@ async function runOcrCapture(){
 
   ocrBusy = true;
   try{
-    // Recorta una franja pequeña y central para enfocar la etiqueta (~20cm) y acelerar el OCR
+    // Recorta una franja pequeña y central para enfocar la etiqueta (~20cm)
     const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
-    const cropW = vw * 0.6, cropH = vh * 0.22;
+    const cropW = vw * 0.7, cropH = vh * 0.26;
     const cropX = (vw - cropW) / 2, cropY = (vh - cropH) / 2;
-    canvasEl.width = cropW; canvasEl.height = cropH;
+
+    // Escala x2 el recorte: los códigos son pequeños en la imagen original
+    // y una imagen más grande mejora mucho la precisión del OCR.
+    const scale = 2;
+    canvasEl.width = cropW * scale;
+    canvasEl.height = cropH * scale;
     const ctx = canvasEl.getContext('2d');
-    ctx.drawImage(videoEl, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(videoEl, cropX, cropY, cropW, cropH, 0, 0, canvasEl.width, canvasEl.height);
+    preprocessCanvas(canvasEl);
 
     setOcrStatus('🔎 Analizando etiqueta...');
     const { data: { text } } = await ocrWorker.recognize(canvasEl);
@@ -741,7 +791,7 @@ async function runOcrCapture(){
         handleScannedCode(best);
       }
     }
-    if(ocrActive) setOcrStatus('🔎 Buscando texto...');
+    if(ocrActive) setOcrStatus('🔎 Buscando código...');
   }catch(err){
     console.warn('Error de OCR', err);
   }finally{
@@ -752,6 +802,7 @@ async function runOcrCapture(){
 
 function stopOcrScanner(){
   ocrActive = false;
+  ocrStarting = false;
   if(ocrTimer){ clearTimeout(ocrTimer); ocrTimer = null; }
   if(ocrStream){
     ocrStream.getTracks().forEach(t => t.stop());
@@ -764,14 +815,7 @@ function stopOcrScanner(){
     ocrWorker = null;
     w.terminate().catch(()=>{});
   }
-  const toggleBtn = document.getElementById('btnToggleCamera');
-  if(toggleBtn) toggleBtn.textContent = 'Iniciar cámara';
-  setOcrStatus('Toca "Iniciar cámara" para escanear');
-}
-
-function toggleCamera(){
-  if(ocrActive) stopOcrScanner();
-  else startOcrScanner();
+  setOcrStatus('Iniciando cámara...');
 }
 
 /* -------------------------------------------------------------------------
@@ -805,7 +849,6 @@ function setupEventListeners(){
   });
 
   // Escáner
-  document.getElementById('btnToggleCamera').addEventListener('click', toggleCamera);
   document.getElementById('btnManualCodeGo').addEventListener('click', ()=>{
     const val = document.getElementById('manualCodeInput').value.trim();
     if(val) handleScannedCode(val);
